@@ -1,0 +1,2784 @@
+from tabulate import tabulate
+from flask import Flask, request, jsonify, session
+from flask_session import Session
+import os, requests, re, json, random, traceback
+from dotenv import load_dotenv
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+import chromadb
+from chromadb.config import Settings
+from supabase import create_client, Client
+from ast import literal_eval
+from flask_cors import CORS
+import traceback
+from datetime import datetime
+
+# ---------------- Load Environment Variables ----------------
+load_dotenv()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+print("OPENROUTER_API_KEY:", OPENROUTER_API_KEY)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+FRONTEND_API_KEY = os.getenv("FRONTEND_API_KEY")
+
+
+if not OPENROUTER_API_KEY:
+    raise ValueError("OPENROUTER_API_KEY not set — please check your .env")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env")
+
+# ---------------- Initialize Clients ----------------
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# app = Flask(__name__)
+# app.secret_key = os.getenv("FLASK_SECRET_KEY", "'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5hZHhyZXhwZmNwbm9jbnNqamJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE0NjAwNzMsImV4cCI6MjA2NzAzNjA3M30.5T0hxDZabIJ_mTrtKpra3beb7OwnnvpNcUpuAhd28Mw'")
+# app.config['SESSION_TYPE'] = 'filesystem'
+# app.config["SESSION_PERMANENT"] = False
+# CORS(app, 
+#     supports_credentials=True,
+#     origins=["http://localhost:3000", "http://localhost:5173"])
+# Session(app)
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5hZHhyZXhwZmNwbm9jbnNqamJrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE0NjAwNzMsImV4cCI6MjA2NzAzNjA3M30.5T0hxDZabIJ_mTrtKpra3beb7OwnnvpNcUpuAhd28Mw'")
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config["SESSION_PERMANENT"] = False
+
+CORS(
+    app,
+    resources={r"/*": {"origins": "https://debugmate.we3vision.com/"}},
+    supports_credentials=True,
+    expose_headers=["Authorization"],
+    allow_headers=["Content-Type", "Authorization"]
+)
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",  # allows cross-domain usage
+    SESSION_COOKIE_SECURE=True       # must be HTTPS
+)
+CORS(app, 
+    supports_credentials=True,
+    origins=[ "https://debugmate.we3vision.com/"])
+Session(app)
+
+def verify_api_key():
+    token = request.headers.get("Authorization")
+    return token == "Bearer debugmate123"
+
+
+INTRO_LINES = [
+    "🔎 Here’s what I found based on your query:",
+    "📌 Here’s the information you asked for:",
+    "📝 Based on your request, here are the details:",
+    "💡 I looked it up for you, here’s what I got:"
+]
+
+OUTRO_LINES = [
+    "✅ Would you like me to also show related tasks or more details?",
+    "🤔 Do you want me to break this down further or highlight specific parts?",
+    "📌 Let me know if you’d like me to expand on any section.",
+    "✨ I can also share related project notes if you want."
+]
+
+
+# -------------------- TECHNICAL PROMPT DETECTOR --------------------
+def is_technical_prompt(query, project_data):
+    q = query.lower()
+    project_keywords = set()
+    for proj in project_data:
+        for field in proj.values():
+            if isinstance(field, str):
+                project_keywords.update(field.lower().split())
+
+    # Keywords for identifying technical/project-based questions
+    tech_terms = [
+        "api", "flask", "backend", "frontend", "database", "sql", "supabase",
+        "postgres", "integration", "deploy", "debug", "project", "bug",
+        "function", "variable", "class", "model", "server", "test", "code",
+        "error", "chatbot", "ai", "nlp", "authentication", "authorization"
+    ]
+
+    return any(word in q for word in project_keywords.union(tech_terms))
+
+
+def summarize_history(history):
+    history_summary = summarize_history(history)
+    for h in history:
+        if h["role"] == "assistant":
+            # Do not give full answers, just label them
+            history_summary.append("Assistant responded earlier about a similar topic.")
+        else:
+            history_summary.append(f"User asked: {h['content'][:60]}...")
+    return "\n".join(history_summary)
+
+
+# def generate_alignment_line(user_query: str, response: str, project_data: list) -> str:
+#     """
+#     Returns one-line accuracy result for technical queries.
+#     """
+#     try:
+#         result = verify_response_final(user_query, response, project_data)
+#         score = result.get("alignment_score", 0)
+#         trust = result.get("trust_level", "Review 🚫")
+#         return f"\n\n🔹 Accuracy: {score} ({trust})"
+#     except Exception as e:
+#         print("⚠ Accuracy check failed:", e)
+#         return ""
+# ---------------- Persistent Chat Memory ----------------
+def get_user_id(email: str) -> str | None:
+    """Fetch user id from Supabase using email."""
+    try:
+        res = supabase.table("user_perms").select("id").eq("email", email).execute()
+        if res.data:
+            return res.data[0]["id"]
+    except Exception as e:
+        print("⚠ get_user_id error:", e)
+    return None
+from datetime import datetime, timezone
+
+def save_chat_message(user_email: str, role: str, content: str,
+                      project_id: str = None, chat_id: str = None, keep_limit: int = 200):
+    """Save chat message with full privacy isolation (user + project + chat)."""
+    user_id = get_user_id(user_email)
+    if not user_id:
+        print("⚠ Cannot save chat — user not found:", user_email)
+        return
+
+    project_id = project_id or session.get("project_id", "default")
+    chat_id = chat_id or session.get("chat_id", "default")
+    session.setdefault("chat_history", [])
+    session["chat_history"].append({"role": role, "content": content})
+    # do NOT trim session history (we use Supabase history instead)
+    session["chat_history"] = session["chat_history"]
+
+
+
+    try:
+        # Insert new message with all isolation keys
+        supabase.table("user_memory").insert({
+            "user_id": user_id,
+            "project_id": project_id,
+            "chat_id": chat_id,
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }).execute()
+
+        # Auto-trim oldest messages per chat
+        res = (
+            supabase.table("user_memory")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+            .eq("chat_id", chat_id)
+            .order("timestamp", desc=True)
+            .execute()
+        )
+        ids = [r["id"] for r in res.data] if res.data else []
+        if len(ids) > keep_limit:
+            old_ids = ids[keep_limit:]
+            for oid in old_ids:
+                supabase.table("user_memory").delete().eq("id", oid).execute()
+
+    except Exception as e:
+        print("⚠ save_chat_message error:", e)
+
+
+
+def load_chat_history(user_email: str, project_id: str = None,
+                      chat_id: str = None, limit: int = 15):
+    """Fetch private chat history for one user, project, and chat_id."""
+    try:
+        if not user_email:
+            print("⚠ No email found — skipping history load.")
+            return session.get("chat_history", [])
+
+        # Get user_id
+        user_info = supabase.table("user_perms").select("id").eq("email", user_email).execute()
+        if not user_info.data:
+            print(f"⚠ No user found for email: {user_email}")
+            return []
+
+        user_id = user_info.data[0]["id"]
+        project_id = project_id or "default"
+        chat_id = chat_id or "default"
+
+        # Query isolated chat messages
+        res = (
+            supabase.table("user_memory")
+            .select("role, content, timestamp")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+            .eq("chat_id", chat_id)
+            .order("timestamp", desc=False)
+            .limit(limit)
+            .execute()
+        )
+
+        if not res.data:
+            # print(f"📭 No previous messages for {user_email} | {project_id} | {chat_id}")
+            print(f"📭 may be some data is not there!{chat_id}")
+            
+            return []
+        print(f"[DEBUG] Loading chat history for {user_email} | project_id={project_id} | chat_id={chat_id}")
+
+        print(f"📜 Loaded {len(res.data)} messages for {user_email} | {project_id} | {chat_id}")
+        return [{"role": m["role"], "content": m["content"]} for m in res.data]
+
+    except Exception as e:
+        print("⚠ load_chat_history error:", e)
+        return []
+
+# def format_response(
+#     query: str,
+#     project_data: dict = None,
+#     role_data: dict = None,
+#     notes: list = None,
+#     fallback: str = None
+# ) -> str:
+#     """
+#     Formats chatbot responses into a clean, human-friendly, professional style.
+#     """
+
+#     intro = random.choice(INTRO_LINES)
+#     outro = random.choice(OUTRO_LINES)
+
+#     response = f"{intro}\n\n---\n"
+
+#     # --- Project Data Section ---
+#     if project_data:
+#         response += "### 📂 Project Summary\n"
+#         if project_data.get("project_name"):
+#             response += f"- *Project Name:* {project_data['project_name']}\n"
+#         if project_data.get("project_id"):
+#             response += f"- *Project ID:* {project_data['project_id']}\n"
+#         if project_data.get("description"):
+#             response += f"- *Description:* {project_data['description']}\n"
+#         if project_data.get("client"):
+#             response += f"- *Client:* {project_data['client']}\n"
+#         response += "\n"
+
+#         # Timeline
+#         if project_data.get("start_date") or project_data.get("end_date") or project_data.get("status"):
+#             response += "### 📅 Timeline\n"
+#             if project_data.get("start_date"):
+#                 response += f"- *Start Date:* {project_data['start_date']}\n"
+#             if project_data.get("end_date"):
+#                 response += f"- *End Date:* {project_data['end_date']}\n"
+#             if project_data.get("status"):
+#                 response += f"- *Status:* {project_data['status']}\n"
+#             response += "\n"
+
+#         # Tech Stack
+#         if project_data.get("tech_stack"):
+#             response += "### 🛠 Key Technologies\n"
+#             if isinstance(project_data["tech_stack"], list):
+#                 for tech in project_data["tech_stack"]:
+#                     response += f"- {tech}\n"
+#             else:
+#                 response += f"- {project_data['tech_stack']}\n"
+#             response += "\n"
+
+#         # Leaders
+#         if project_data.get("leaders") or project_data.get("team_members"):
+#             response += "### 👥 Project Leaders\n"
+#             if project_data.get("leaders"):
+#                 response += f"- *Lead:* {project_data['leaders']}\n"
+#             if project_data.get("team_members"):
+#                 if isinstance(project_data["team_members"], list):
+#                     response += f"- *Team Members:* {', '.join(project_data['team_members'])}\n"
+#                 else:
+#                     response += f"- *Team Members:* {project_data['team_members']}\n"
+#             response += "\n"
+
+#     # --- Role Section ---
+#     if role_data:
+#         response += "### 👤 Your Role & Responsibilities\n"
+#         for key, value in role_data.items():
+#             if isinstance(value, list):
+#                 response += f"- *{key.replace('_',' ').title()}:*\n"
+#                 for v in value:
+#                     response += f"  - {v}\n"
+#             else:
+#                 response += f"- *{key.replace('_',' ').title()}:* {value}\n"
+#         response += "\n"
+
+#     # --- Notes Section ---
+#     if notes:
+#         response += "### ⚡ Important Notes\n"
+#         for note in notes:
+#             response += f"- {note}\n"
+#         response += "\n"
+
+#     # --- Fallback ---
+#     if not (project_data or role_data or notes) and fallback:
+#         clean_fb = fallback.strip()
+#         if len(clean_fb) <= 100 and ":" not in clean_fb and "\n" not in clean_fb:
+#             # One-line → conversational
+#             response += f"✅ {clean_fb}\n\n"
+#         else:
+#             # Multi-line → structured
+#             response += f"### 💡 Answer\n{clean_fb}\n\n"
+
+#     # Outro
+#     response += outro + "\n"
+
+#     return response
+import random
+
+def format_response(
+    query: str,
+    project_data: dict = None,
+    role_data: dict = None,
+    notes: list = None,
+    fallback: str = None,
+    llm_response: str = None
+) -> str:
+    """
+    Adaptive formatting of chatbot responses with smart highlights, emojis, symbols, and bold.
+     Adaptive formatting:
+    - Full project overview format if user asks for 'all project details' or 'project info'
+    - Otherwise, follow short adaptive response
+    """
+    
+
+    # Determine query type
+    query_type = "general"
+    if project_data:
+        query_type = "project"
+    elif role_data:
+        query_type = "role"
+    elif notes:
+        query_type = "notes"
+
+    # Dynamic prefaces with consistent formatting
+    prefaces_dict = {
+        "project": [
+            "PROJECT OVERVIEW\n\n",
+            "PROJECT DETAILS\n\n",
+            "PROJECT SUMMARY\n\n"
+        ],
+        "role": [
+            "ROLE INFORMATION\n\n",
+            "YOUR ROLE\n\n",
+            "TEAM DETAILS\n\n"
+        ],
+        "notes": [
+            "DOCUMENT REFERENCES\n\n",
+            "KNOWLEDGE BASE\n\n",
+            "KEY POINTS\n\n"
+        ],
+        "general": [
+            "INFORMATION\n\n",
+            "DETAILS\n\n",
+            "SUMMARY\n\n"
+        ]
+    }
+
+    preface = random.choice(prefaces_dict.get(query_type, prefaces_dict["general"]))
+    # Keywords for full project info request
+    full_project_keywords = [
+        "all project details",
+        "project info",
+        "full project details",
+        "project summary",
+        "give me project details"
+    ]
+    response_parts = []
+    # Check if user wants full project info
+    if any(k in query.lower() for k in full_project_keywords) and project_data:
+        # Full detailed project format with spacing
+        project_lines = ["PROJECT INFORMATION\n"]
+
+        # Define fields with their display names and formatting
+        field_display = {
+            "project_name": "Project Name",
+            "status": "Status",
+            "priority": "Priority",
+            "client_name": "Client",
+            "end_date": "End Date",
+            "start_date": "Start Date",
+            "description": "Description",
+            "assigned_to": "Team Members",
+            "tech_stack": "Technologies"
+        }
+
+        # Add each field with proper formatting
+        for field, display_name in field_display.items():
+            value = project_data.get(field)
+            if value:
+                # Format values
+                if field == "status":
+                    status_emoji = "✅" if str(value).lower() == "completed" else "⏳" if "progress" in str(value).lower() else "⚠️"
+                    value = f"{value} {status_emoji}"
+                elif field == "priority":
+                    priority_emoji = "🔥" if str(value).lower() == "high" else "⭐" if str(value).lower() == "medium" else ""
+                    value = f"{value} {priority_emoji}"
+                elif field in ["start_date", "end_date"]:
+                    value = f"📅 {value}"
+                elif field == "tech_stack" and isinstance(value, list):
+                    value = ", ".join(value)
+                
+                project_lines.append(f"{display_name.upper()}: {value}")
+        
+        if project_lines:
+            response_parts.append("\n".join(project_lines))
+
+    # --- Role Data ---
+    if role_data:
+        role_lines = ["ROLE INFORMATION\n"]
+        
+        # Role information section
+        if role_data.get('role'):
+            role_lines.append(f"ROLE: {role_data['role'].upper()}")
+        
+        # Team information
+        if role_data.get('team_members'):
+            role_lines.append(f"\nTEAM MEMBERS: {role_data['team_members']}")
+        
+        # Assigned tasks
+        if role_data.get('assigned_tasks'):
+            tasks = "\n  • " + "\n  • ".join(role_data['assigned_tasks']) if isinstance(role_data['assigned_tasks'], list) else role_data['assigned_tasks']
+            role_lines.append(f"\nASSIGNED TASKS:{tasks}")
+        
+        # Project leadership
+        if role_data.get('leader_of_project'):
+            role_lines.append(f"\nPROJECT LEAD: {role_data['leader_of_project']}")
+        
+        if role_lines:
+            response_parts.append("\n".join(role_lines))
+
+    # --- Notes / RAG Data ---
+    if notes:
+        notes_lines = ["NOTES\n"]
+        notes_lines.extend([f"• {note}" for note in notes if note.strip()])
+        if len(notes_lines) > 1:  # If we have any notes besides the header
+            response_parts.append("\n".join(notes_lines))
+
+    # --- LLM Fallback ---
+    if llm_response and not response_parts:
+        # Format LLM response with better structure
+        formatted_response = []
+        for line in llm_response.split('\n'):
+            line = line.strip()
+            if line.endswith(':'):
+                formatted_response.append(f"\n{line.upper()}")
+            elif line.startswith(('- ', '* ', '• ')):
+                formatted_response.append(f"  • {line[2:].strip()}")
+            elif line and not line.startswith('**'):  # Skip markdown bold markers
+                formatted_response.append(line)
+        
+        response_parts.append("\n".join(formatted_response))
+
+    # --- Generic Fallback ---
+    if not response_parts and fallback:
+        response_parts.append(fallback)
+    elif not response_parts:
+        response_parts.append("I couldn't find the information you're looking for. Could you please provide more details?")
+
+    # Combine all parts with proper spacing
+    final_response = f"{preface}"
+    
+    # Add response parts with proper spacing
+    for part in response_parts:
+        if part.strip():
+            final_response += f"\n\n{part.strip()}"
+    
+    # Ensure consistent line endings and spacing
+    final_response = '\n'.join(line.strip() for line in final_response.split('\n'))
+    final_response = '\n\n'.join(para for para in final_response.split('\n\n') if para.strip())
+    return final_response
+
+
+def print_last_conversations(user_email: str, count: int = 5):
+    """Fetch and print the last count messages from history (session + Supabase)."""
+    try:
+        history = load_chat_history(user_email, limit=count)
+        if not history:
+            return
+        print(f"\n🗂 Last {len(history)} messages for {user_email}:")
+        for i, msg in enumerate(history[-count:], 1):
+            
+            role = msg.get("role", "?")
+            content = msg.get("content", "").strip()
+            print(f"{i}. [{role}] {content}")
+        print("—" * 50 + "\n")
+    except Exception as e:
+        print("⚠ Error fetching/printing last conversations:", e)
+# =============================================================================================================================================================
+# ============================================================accuracy check functions===================================================================================
+# ==============================================================================================================================================================
+
+def is_technical_prompt(user_input: str, project_data: list) -> bool:
+    """
+    Returns True ONLY when the user's query is technical or project-related.
+    Filters out greetings, company name, personal or general knowledge queries.
+    """
+    if not user_input:
+        return False
+
+    text = user_input.lower().strip()
+
+    # --- Non-technical patterns (skip completely) ---
+    non_tech_patterns = [
+        r"\bwho is narendra\b", r"\bprime minister\b", r"\bweather\b", r"\btime\b",
+        r"\bcompany name\b", r"\bwe3vision\b", r"\babout company\b",
+        r"\bhello\b", r"\bhi\b", r"\bhey\b", r"\bthanks\b", r"\bbye\b",
+        r"\bgood (morning|afternoon|evening)\b", r"\bhow are you\b",
+        r"\bwhat('?s| is) your name\b"
+    ]
+    for pat in non_tech_patterns:
+        if re.search(pat, text):
+            return False
+
+    # --- Quick tokenization ---
+    tokens = re.findall(r"[a-z0-9_@]+", text)
+    if len(tokens) < 2:
+        return False
+
+    # --- Technical/project keywords ---
+    tech_keywords = {
+        "api", "flask", "backend", "frontend", "database", "sql", "supabase", "bug",
+        "error", "debug", "react", "node", "python", "javascript", "deployment",
+        "auth", "token", "jwt", "docker", "kubernetes", "langchain", "chroma",
+        "project", "timeline", "leader", "team", "client", "scope", "stack",
+        "tech", "framework", "field", "deadline", "responsibility"
+    }
+    if any(k in text for k in tech_keywords):
+        return True
+
+    # --- Project-specific token match ---
+    project_keywords = set()
+    for proj in project_data or []:
+        if not isinstance(proj, dict):
+            continue
+        for key in (
+            "project_name", "project_description", "project_scope",
+            "tech_stack", "tech_stack_custom", "project_field", "leader_of_project"
+        ):
+            val = proj.get(key)
+            if val:
+                project_keywords.update(re.findall(r"[a-z0-9_@]+", str(val).lower()))
+    if not project_keywords:
+        return False
+
+    overlap = len([t for t in tokens if t in project_keywords])
+    if overlap >= 1:
+        return True
+import re
+from difflib import SequenceMatcher
+
+# regexes
+EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.I)
+WORD_TOKEN_RE = re.compile(r"[a-z0-9@._-]+", re.I)
+
+def _token_set(s: str):
+    return set([t.lower() for t in WORD_TOKEN_RE.findall(s or "")])
+
+def _normalize_for_compare(s: str) -> str:
+    """Lowercase and remove punctuation except alphanumerics and spaces."""
+    if not s:
+        return ""
+    s = s.lower()
+    # remove punctuation but keep @ . - _ for emails/tokens
+    s = re.sub(r"[^\w\s@._-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _extract_project_agg(project_data: list):
+    """
+    Return aggregated field strings and email sets:
+    {name, status, timeline, leader, leader_emails(set), team_text, team_emails(set), tech_text}
+    """
+    agg = {
+        "name": "",
+        "status": "",
+        "timeline": "",
+        "leader": "",
+        "leader_emails": set(),
+        "team": "",
+        "team_emails": set(),
+        "tech": "",
+        "client": "",
+        "description": "",
+    }
+    for p in project_data or []:
+        if not isinstance(p, dict):
+            continue
+        # name
+        for k in ("project_name","project_title","name"):
+            if p.get(k):
+                agg["name"] += " " + str(p.get(k))
+        # status
+        if p.get("status"):
+            agg["status"] += " " + str(p.get("status"))
+        # timeline
+        for k in ("start_date","end_date"):
+            if p.get(k):
+                agg["timeline"] += " " + str(p.get(k))
+        # leader fields
+        for k in ("leader_of_project","leader","project_lead","leader_name"):
+            if p.get(k):
+                agg["leader"] += " " + str(p.get(k))
+        # leader emails (common custom names)
+        for ek in ("leader_email","leader_of_project_email","lead_email"):
+            if p.get(ek):
+                agg["leader_emails"].add(str(p.get(ek)).lower())
+        # team members and assigned emails
+        members = p.get("team_members") or []
+        if isinstance(members, list):
+            for m in members:
+                if isinstance(m, dict):
+                    # try email then name/role
+                    email = m.get("email") or m.get("mail")
+                    if email:
+                        agg["team_emails"].add(str(email).lower())
+                    # join human tokens
+                    agg["team"] += " " + " ".join([str(v) for v in m.values() if v])
+                else:
+                    agg["team"] += " " + str(m)
+        # assigned_to_emails
+        for k in ("assigned_to_emails","assigned_to","assigned"):
+            val = p.get(k)
+            if isinstance(val, (list,tuple)):
+                for e in val:
+                    if e:
+                        agg["team_emails"].add(str(e).lower())
+            elif val:
+                agg["team_emails"].add(str(val).lower())
+        # tech
+        for tk in ("tech_stack","tech_stack_custom","technology"):
+            tval = p.get(tk)
+            if tval:
+                if isinstance(tval, list):
+                    agg["tech"] += " " + " ".join([str(x) for x in tval])
+                else:
+                    agg["tech"] += " " + str(tval)
+        # client and description
+        if p.get("client_name"):
+            agg["client"] += " " + str(p.get("client_name"))
+        if p.get("project_description"):
+            agg["description"] += " " + str(p.get("project_description"))
+        if p.get("project_scope"):
+            agg["description"] += " " + str(p.get("project_scope"))
+    # normalize strings
+    for k in ("name","status","timeline","leader","team","tech","client","description"):
+        agg[k] = _normalize_for_compare(agg[k])
+    agg["leader_emails"] = set(e for e in agg["leader_emails"] if e)
+    agg["team_emails"] = set(e for e in agg["team_emails"] if e)
+    return agg
+
+# synonyms for status canonicalization
+_STATUS_CANONICAL = {
+    "in progress": ["in progress","in-progress","ongoing","started","active"],
+    "not started": ["not started","pending","planned","yet to start"],
+    "completed": ["completed","done","finished","delivered"],
+    "on hold": ["on hold","paused","blocked"]
+}
+
+def _match_status(reply_clean: str, proj_status_clean: str) -> float:
+    """
+    Return score 0..100 for status matching.
+    Exact canonical match -> 100, synonym -> 95, token overlap -> ratio*100 fallback.
+    """
+    if not reply_clean or not proj_status_clean:
+        return 0.0
+    # canonicalize both into tokens
+    r = reply_clean.lower()
+    p = proj_status_clean.lower()
+    # direct substring
+    if r in p or p in r:
+        return 100.0
+    # check synonyms
+    for can, syns in _STATUS_CANONICAL.items():
+        if any(s in p for s in syns) and any(s in r for s in syns):
+            return 95.0
+    # token overlap fallback
+    rtoks = _token_set(r)
+    ptoks = _token_set(p)
+    if not ptoks:
+        return 0.0
+    overlap = len(rtoks & ptoks) / max(1, len(ptoks))
+    return round(overlap * 100, 2)
+
+def _clean_reply_text(text: str) -> str:
+    """
+    Remove headings, markdown bullets, repeated whitespace, punctuation noise.
+    Returns a lowercase cleaned string suitable for substring/token matching.
+    """
+    if not text:
+        return ""
+    s = text
+    # remove common section headings words on their own lines
+    s = re.sub(r"(?mi)^(summary|details|information|info|result|solution|overview|response)\s*$", "", s, flags=re.MULTILINE)
+    # remove lines that are short all-caps headings
+    s = re.sub(r"(?m)^[A-Z\s]{2,60}\n", "", s)
+    # remove bullets and markdown characters
+    s = re.sub(r"[-•*]{1,2}\s+", " ", s)
+    # remove parentheses content (often email after name)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    # replace newlines with spaces and collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower()
+
+def _extract_project_fields(project_data: list):
+    """
+    Return a dict of aggregated strings for the key fields we check:
+    name, leader (name/email), timeline (start/end), team (names/emails), tech, client, status, description
+    """
+    agg = {
+        "name": [],
+        "leader": [],
+        "leader_emails": set(),
+        "timeline": [],
+        "team": [],
+        "team_emails": set(),
+        "tech": [],
+        "client": [],
+        "status": [],
+        "description": []
+    }
+    for proj in project_data or []:
+        if not isinstance(proj, dict):
+            continue
+        # name
+        for k in ("project_name", "project_title", "name", "custom_uuid"):
+            if proj.get(k):
+                agg["name"].append(str(proj.get(k)))
+        # leader
+        for k in ("leader_of_project", "leader", "project_lead"):
+            if proj.get(k):
+                agg["leader"].append(str(proj.get(k)))
+        # leader emails
+        for k in ("leader_email", "leader_of_project_email",):
+            if proj.get(k):
+                agg["leader_emails"].add(str(proj.get(k)).lower())
+        # timeline
+        for k in ("start_date", "end_date"):
+            if proj.get(k):
+                agg["timeline"].append(str(proj.get(k)))
+        # team members
+        members = proj.get("team_members") or []
+        if isinstance(members, list):
+            for m in members:
+                if isinstance(m, dict):
+                    # common keys: name,email
+                    if m.get("email"):
+                        agg["team_emails"].add(str(m.get("email")).lower())
+                    # add name-like tokens of member dict
+                    agg["team"].append(" ".join([str(v) for v in m.values() if v]))
+                else:
+                    agg["team"].append(str(m))
+        # assigned emails
+        for k in ("assigned_to_emails", "assigned_to", "assigned"):
+            val = proj.get(k)
+            if isinstance(val, (list, tuple)):
+                for e in val:
+                    agg["team_emails"].add(str(e).lower())
+            elif val:
+                agg["team_emails"].add(str(val).lower())
+        # tech
+        for k in ("tech_stack", "tech_stack_custom", "technology"):
+            val = proj.get(k)
+            if val:
+                if isinstance(val, list):
+                    agg["tech"].extend([str(x) for x in val])
+                else:
+                    agg["tech"].append(str(val))
+        # client & status & description
+        if proj.get("client_name"):
+            agg["client"].append(str(proj.get("client_name")))
+        if proj.get("status"):
+            agg["status"].append(str(proj.get("status")))
+        for k in ("project_description","project_scope"):
+            if proj.get(k):
+                agg["description"].append(str(proj.get(k)))
+    # join lists to single strings
+    for k in ("name","leader","timeline","team","tech","client","status","description"):
+        agg[k] = " ".join(agg[k]).strip().lower()
+    agg["leader_emails"] = set(e for e in agg["leader_emails"] if e)
+    agg["team_emails"] = set(e for e in agg["team_emails"] if e)
+    return agg
+
+def verify_response_final(query: str, reply: str, project_data: list, debug: bool=False) -> dict:
+    """
+    Field-prioritised strict verifier that returns realistic scores for short correct replies.
+    Returns {"alignment_score": float or None, "trust_level": str, "recommendation": str}
+    """
+    try:
+        if not project_data or not isinstance(project_data, list) or len(project_data) == 0:
+            return {"alignment_score": None, "trust_level": "No Data", "recommendation": "No project data available."}
+
+        q = (query or "").strip().lower()
+        # Use cleaned reply for comparisons
+        reply_clean = _clean_reply_text(reply)
+        reply_norm = _normalize_for_compare(reply_clean)
+
+        agg = _extract_project_agg(project_data)
+        if debug:
+            print("verify debug agg:", {k:(v[:120]+"..." if isinstance(v,str) and len(v)>120 else v) for k,v in agg.items()})
+
+        # Determine field intent (priority)
+        detected = []
+        if any(kw in q for kw in ["project name","project title","name of the project","what is the project name","project name"]):
+            detected.append("name")
+        if any(kw in q for kw in ["status","what is the status","project status","is the project completed","progress","phase"]):
+            detected.append("status")
+        if any(kw in q for kw in ["start date","end date","timeline","when does","when will","start","end","deadline"]):
+            detected.append("timeline")
+        if any(kw in q for kw in ["who is the leader","project leader","who is the lead","project lead","leader"]):
+            detected.append("leader")
+        if any(kw in q for kw in ["team members","team","members","who are the team","give my team"]):
+            detected.append("team")
+        if any(kw in q for kw in ["tech stack","tech","technology","framework","tools","languages"]):
+            detected.append("tech")
+        # fallback: if query contains 'project' treat as description/name check
+        if not detected:
+            if "project" in q:
+                detected.append("description")
+            else:
+                detected.append("description")
+
+        scores = []
+        for fld in detected:
+            proj_field_text = agg.get(fld, "")
+            if fld == "name":
+                # exact or substring
+                if reply_norm and proj_field_text and (reply_norm == proj_field_text or reply_norm in proj_field_text or proj_field_text in reply_norm):
+                    scores.append(99.0)
+                    continue
+                # token overlap strong boost for short replies
+                rts = _token_set(reply_norm)
+                pts = _token_set(proj_field_text)
+                if rts and pts:
+                    overlap = len(rts & pts)
+                    if len(rts) <= 6 and overlap >= 1:
+                        scores.append(min(99.0, 85.0 + overlap*5.0))
+                        continue
+                # fallback similarity
+                sim = SequenceMatcher(None, reply_norm, proj_field_text).ratio()
+                scores.append(round(sim * 70, 2))
+
+            elif fld == "status":
+                # compare cleaned reply to proj status
+                score = _match_status(reply_norm, agg.get("status",""))
+                scores.append(score)
+
+            elif fld == "leader":
+                # email exact or name overlap
+                reply_emails = set(e.lower() for e in EMAIL_RE.findall(reply))
+                if reply_emails and agg.get("leader_emails"):
+                    if reply_emails & agg["leader_emails"]:
+                        scores.append(99.0); continue
+                # token overlap with leader name
+                rts = _token_set(reply_norm)
+                pts = _token_set(agg.get("leader",""))
+                if rts and pts and len(rts & pts) >= 1:
+                    # short reply strong
+                    scores.append(min(98.0, 85.0 + len(rts & pts)*5.0)); continue
+                # fallback similarity
+                sim = SequenceMatcher(None, reply_norm, agg.get("leader","")).ratio()
+                scores.append(round(sim * 70, 2))
+
+            elif fld == "team":
+                # check for team_emails present
+                reply_emails = set(e.lower() for e in EMAIL_RE.findall(reply))
+                if reply_emails and agg.get("team_emails"):
+                    if reply_emails & agg["team_emails"]:
+                        scores.append(98.0); continue
+                # token coverage of team members names
+                pts = _token_set(agg.get("team",""))
+                rts = _token_set(reply_norm)
+                if pts:
+                    coverage = len(rts & pts) / max(1, len(pts))
+                    scores.append(round(min(1.0, coverage) * 100, 2)); continue
+                scores.append(0.0)
+
+            elif fld == "tech":
+                pts = _token_set(agg.get("tech",""))
+                rts = _token_set(reply_norm)
+                if pts:
+                    coverage = len(rts & pts) / max(1, len(pts))
+                    scores.append(round(min(1.0, coverage) * 100, 2)); continue
+                scores.append(0.0)
+
+            elif fld == "timeline":
+                # check year or date tokens
+                def find_year(s):
+                    m = re.search(r"\b(20\d{2}|\d{4})\b", s)
+                    return m.group(0) if m else None
+                proj_year = find_year(agg.get("timeline",""))
+                rep_year = find_year(reply)
+                if proj_year and rep_year and proj_year == rep_year:
+                    scores.append(95.0); continue
+                # if reply contains the proj start date substring
+                if agg.get("timeline","") and reply_norm and reply_norm in agg.get("timeline",""):
+                    scores.append(98.0); continue
+                # fallback token ratio
+                pts = _token_set(agg.get("timeline",""))
+                rts = _token_set(reply_norm)
+                if pts:
+                    coverage = len(rts & pts) / max(1, len(pts))
+                    scores.append(round(coverage * 100, 2)); continue
+                scores.append(0.0)
+
+            else:  # description fallback
+                sim = SequenceMatcher(None, reply_norm, agg.get("description","")).ratio()
+                pts = _token_set(agg.get("description",""))
+                rts = _token_set(reply_norm)
+                token_ratio = len(rts & pts) / max(1, len(pts)) if pts else 0.0
+                scores.append(round(min(1.0, (0.65*sim + 0.35*token_ratio))*100, 2))
+
+        # aggregate: prefer highest (field-priority)
+        valid = [s for s in scores if s is not None]
+        if not valid:
+            return {"alignment_score": None, "trust_level": "No Data", "recommendation": "No relevant project fields."}
+        final_score = round(max(valid), 2)
+
+        if final_score >= 90:
+            trust = "Trusted ✅"
+            rec = "Accurate and consistent with project data."
+        elif final_score >= 70:
+            trust = "Moderate ⚠️"
+            rec = "Partially aligned; verify minor details."
+        else:
+            trust = "Low ❌"
+            rec = "May not align — please verify."
+
+        return {"alignment_score": final_score, "trust_level": trust, "recommendation": rec}
+
+    except Exception as e:
+        print("⚠ verify_response_strict error:", e)
+        return {"alignment_score": None, "trust_level": "Error", "recommendation": "Verification error."}
+# =============================================================================================================================================================
+# ============================================================announcements functions===================================================================================
+# ==============================================================================================================================================================
+
+# @app.route("/announcements/send", methods=["POST"])
+# def send_announcement():
+#     """Send announcement to specific user(s)"""
+#     try:
+#         data = request.get_json() or {}
+#         sender_email = session.get("user_email")
+#         recipient_email = data.get("recipient_email")
+#         message = data.get("message", "").strip()
+        
+#         if not sender_email:
+#             return jsonify({"error": "Please login first"}), 401
+#         if not recipient_email:
+#             return jsonify({"error": "Recipient email is required"}), 400
+#         if not message:
+#             return jsonify({"error": "Message is required"}), 400
+            
+#         # Save announcement to Supabase
+#         announcement_data = {
+#             "sender_email": sender_email,
+#             "recipient_email": recipient_email,
+#             "message": message,
+#             "timestamp": datetime.utcnow().isoformat(),
+#             "status": "Pending" if message.startswith("📌 Task") else "Message"
+#         }
+        
+#         result = supabase.table("announcements").insert(announcement_data).execute()
+        
+#         if result.data:
+#             return jsonify({"message": "Announcement sent successfully"})
+#         else:
+#             return jsonify({"error": "Failed to send announcement"}), 500
+            
+#     except Exception as e:
+#         print(f"Error sending announcement: {e}")
+#         return jsonify({"error": str(e)}), 500
+
+# @app.route("/announcements/get", methods=["GET"])
+# def get_announcements():
+#     """Get announcements for current user"""
+#     try:
+#         user_email = session.get("user_email")
+#         if not user_email:
+#             return jsonify({"error": "Please login first"}), 401
+            
+#         print(f"🔍 Getting announcements for user: {user_email}")
+        
+#         # Get announcements where user is sender or recipient
+#         result = supabase.table("announcements").select("*").or_(
+#             f"sender_email.eq.{user_email},recipient_email.eq.{user_email}"
+#         ).order("timestamp", desc=True).execute()
+        
+#         print(f"📊 Supabase result: {result}")
+        
+#         if result.data:
+#             print(f"📝 Found {len(result.data)} announcements")
+#             # Group by recipient_email for display
+#             grouped_announcements = {}
+#             for announcement in result.data:
+#                 recipient = announcement["recipient_email"]
+#                 if recipient not in grouped_announcements:
+#                     grouped_announcements[recipient] = []
+                
+#                 # Format timestamp properly
+#                 timestamp = announcement.get("timestamp", "")
+#                 if timestamp:
+#                     if "T" in timestamp:
+#                         formatted_time = timestamp[:16].replace("T", " ")
+#                     else:
+#                         formatted_time = timestamp[:16]
+#                 else:
+#                     formatted_time = "Unknown"
+                
+#                 grouped_announcements[recipient].append({
+#                     "sender": announcement["sender_email"],
+#                     "text": announcement["message"],
+#                     "time": formatted_time,
+#                     "status": announcement.get("status", "Message")
+#                 })
+            
+#             print(f"📦 Grouped announcements: {grouped_announcements}")
+#             return jsonify({"announcements": grouped_announcements})
+#         else:
+#             print("📭 No announcements found")
+#             return jsonify({"announcements": {}})
+            
+#     except Exception as e:
+#         print(f"❌ Error getting announcements: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return jsonify({"error": f"Database error: {str(e)}"}), 500
+
+# @app.route("/announcements/test", methods=["GET"])
+# def test_announcements():
+#     """Test endpoint to check if announcements table exists"""
+#     try:
+#         user_email = session.get("user_email")
+#         if not user_email:
+#             return jsonify({"error": "Please login first"}), 401
+            
+#         # Test if table exists by trying to select from it
+#         result = supabase.table("announcements").select("id").limit(1).execute()
+        
+#         return jsonify({
+#             "message": "Announcements table is accessible",
+#             "user_email": user_email,
+#             "table_exists": True,
+#             "sample_data": result.data if result.data else []
+#         })
+        
+#     except Exception as e:
+#         return jsonify({
+#             "error": f"Table test failed: {str(e)}",
+#             "user_email": session.get("user_email"),
+#             "table_exists": False
+#         }), 500
+
+# @app.route("/announcements/update_status", methods=["POST"])
+# def update_announcement_status():
+#     """Update announcement status"""
+#     try:
+#         data = request.get_json() or {}
+#         announcement_id = data.get("announcement_id")
+#         new_status = data.get("status")
+        
+#         if not announcement_id or not new_status:
+#             return jsonify({"error": "Announcement ID and status are required"}), 400
+            
+#         result = supabase.table("announcements").update({"status": new_status}).eq("id", announcement_id).execute()
+        
+#         if result.data:
+#             return jsonify({"message": "Status updated successfully"})
+#         else:
+#             return jsonify({"error": "Failed to update status"}), 500
+            
+#     except Exception as e:
+#         print(f"Error updating status: {e}")
+#         return jsonify({"error": str(e)}), 500
+
+# =============================================================================================================================================================
+# ============================================================dual chatbot functions===================================================================================
+# ==============================================================================================================================================================
+# ---------------- INTENT DETECTION ----------------
+GENERAL_QUERIES = ["project info", "project details", "overview", "all info", "summary"]
+
+SPECIFIC_FIELDS = {
+    "timeline": ["timeline", "deadline", "end date", "start date", "duration", "finish", "schedule"],
+    "status": ["status", "progress", "phase", "current state"],
+    "client": ["client", "customer"],
+    "leader": ["leader", "manager", "owner", "head"],
+    "members": ["members", "team", "assigned", "who is working", "employees"],
+    "tech_stack": ["tech stack", "technology", "framework", "tools", "languages"],
+}
+def detect_intent(user_query: str) -> str:
+    """
+    Unified intent detector for chatbot.
+    Handles:
+      - Project queries (details, all_projects, timeline, etc.)
+      - Developer queries (coding, debugging, math)
+      - General queries
+      - LLM fallback for ambiguous cases
+    """
+
+    if not user_query:
+        return "general"
+
+    q = user_query.lower().strip()
+
+    # ---------- QUICK PROJECT-RELATED INTENTS ----------
+    if any(word in q for word in [
+        "all project", "all projects", "list projects", "every project", "badha project", "badha"
+    ]):
+        return "all_projects"
+
+    if any(word in q for word in [
+        "project details", "project info", "give me project", "all details", "project", "details of project"
+    ]):
+        return "project_details"
+
+    # ---------- CODING / DEBUGGING / MATH ----------
+    if any(word in q for word in ["code", "function", "script", "program", "sql", "api", "class", "loop", "```"]):
+        if any(word in q for word in ["error", "traceback", "exception", "bug", "fix", "issue"]):
+            return "debugging"
+        return "coding"
+
+    if any(word in q for word in ["solve", "integral", "derivative", "equation", "calculate", "sum", "matrix", "theorem"]):
+        return "math"
+
+    for field, keywords in SPECIFIC_FIELDS.items():
+        for k in keywords:
+            if k in q:
+                return field
+
+    # ---------- GENERAL QUERY DETECTION ----------
+    GENERAL_QUERIES = [
+        "overview", "summary", "introduction", "info", "information", "details", "describe", "about"
+    ]
+    for g in GENERAL_QUERIES:
+        if g in q:
+            return "general"
+
+    # ---------- FALLBACK TO LLM CLASSIFICATION ----------
+    try:
+        intent_prompt = f"""
+        Classify the user query into one of these categories:
+        - "general" → asking for overview or summary.
+        - "timeline" → about dates or schedule.
+        - "client" → about client or customer.
+        - "leader" → about project leader/manager.
+        - "members" → about team members.
+        - "status" → about progress or completion.
+        - "tech_stack" → about technology/tools used.
+        - "project_details" → asking for project details or info.
+        - "all_projects" → asking for list of all projects.
+        - "coding" → about writing or explaining code.
+        - "debugging" → about fixing or analyzing code errors.
+        - "math" → about mathematical problems.
+        - "other" → if none apply.
+        User query: "{user_query}"
+        Reply ONLY with one category name.
+        """
+
+        result = call_openrouter([
+            {"role": "system", "content": "You are an intent classification engine."},
+            {"role": "user", "content": intent_prompt},
+           { "role": "system",
+            "content": "Never repeat the exact same answer from history. Always generate a fresh response using updated info."
+           }
+        ], temperature=0)
+
+        if result:
+            return result.strip().lower()
+    except Exception as e:
+        print(f"[⚠️ detect_intent fallback] {e}")
+
+    # ---------- FINAL FALLBACK ----------
+    return "general"
+
+# # ---------------- Supabase Client ----------------
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Persistent ChromaDB
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection("company_docs")
+
+
+MEMORY_FILE = "memory.json"
+CONFUSION_RESPONSES = [
+    "Hmm, I'm not quite sure what you mean. Could you rephrase it?",
+    "Can you please provide more details?",
+    "Let's try that again — can you explain it another way?",
+    "I'm here to help, but I need a bit more information from you.",
+    "Please clarify your question a little so I can assist better!"
+]
+
+# Known Supabase tables (schema)
+TABLES = {
+    "projects": ["uuid", "project_name", "project_description", "start_date", "end_date", "status",
+                 "assigned_to_emails", "client_name", "upload_documents", "project_scope",
+                 "tech_stack", "tech_stack_custom", "leader_of_project", "project_responsibility",
+                 "role", "role_answers", "custom_questions", "custom_answers", "priority"],
+    "employee_login": ["id", "email", "login_time", "name", "logout_time", "pass"],
+    "user_memory": ["id", "user_id", "name", "known_facts"],
+    "user_perms": ["id", "name", "email", "password", "role", "permission_roles"],
+    "fields ": {
+        "project_name", "status", "tech_stack", "project_description",
+        "start_date", "end_date", "assigned_to_emails", "client_name",
+        "project_scope", "tech_stack_custom", "leader_of_project",
+        "project_responsibility", "role_answers", "custom_questions",
+        "custom_answers", "priority"
+    }
+}
+
+# Tables that must be access-controlled by role/email
+ACCESS_CONTROLLED = {"projects", "employee_login"}
+
+# Columns that are safe to use with ILIKE (text only; no uuid/date/json/arrays)
+SEARCHABLE_COLUMNS = {
+    "projects": [
+        "project_name", "project_description", "status", "client_name",
+        "project_scope", "tech_stack", "tech_stack_custom",
+        "leader_of_project", "project_responsibility",
+        "role", "role_answers", "custom_questions", "custom_answers", "priority"
+    ],
+    "employee_login": ["email", "name"],
+    "user_memory": ["name", "known_facts"],
+    "user_perms": ["name", "email", "role", "permission_roles"],
+}
+
+
+
+def _text_cols(table: str) -> list:
+    """Return only the columns safe for ILIKE in this table."""
+    return SEARCHABLE_COLUMNS.get(table, [])
+
+
+# -------------------- ACCESS CONTROL LOGIC --------------------
+
+class AccessControl:
+    """
+    Role + Identity Based Access Control
+    - Admin, HR → full access to all projects
+    - Employee, Others → restricted to their assigned projects only
+    """
+
+    def _init_(self):
+        self.role_policies = {
+            "Admin": {"scope": "all"},
+            "HR": {"scope": "all"},
+            "Employee": {"scope": "self"},
+            "Others": {"scope": "self"},
+        }
+
+    def get_policy(self, role: str):
+        """Return access policy for the role"""
+        return self.role_policies.get(role, {"scope": "self"})
+
+    def apply_project_filters(self, query, role: str, user_email: str):
+        """
+        Modify query based on role & identity
+        """
+        policy = self.get_policy(role)
+
+        # Admin/HR → unrestricted access
+        if policy["scope"] == "all":
+            return query
+
+        # Employees/Others → restricted
+        if policy["scope"] == "self":
+            return query.eq("assigned_to", user_email)
+
+        return query
+
+
+access_control = AccessControl()
+
+
+# ---------------- Memory Management ----------------
+def load_memory():
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_memory(memory):
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=2)
+
+def update_user_memory(user_input, memory):
+    # Only catch explicit name introductions
+    match = re.search(r"\b(?:my name is|this is|this side)\s+([A-Za-z][A-Za-z\s]{1,40})", user_input, re.IGNORECASE)
+    if match:
+        memory["user_name"] = match.group(1).strip().title()
+        print(f"✅ Stored user name: {memory['user_name']}")
+    return memory
+
+
+# ---------------- Document Processing ----------------
+def load_documents():
+    documents = []
+    if not os.path.exists("company_docs"):
+        return
+    for file in os.listdir("company_docs"):
+        path = os.path.join("company_docs", file)
+        if file.endswith(".pdf"):
+            loader = PyPDFLoader(path)
+        elif file.endswith(".txt"):
+            loader = TextLoader(path, encoding="utf-8")
+        else:
+            continue
+        documents.extend(loader.load())
+    if documents:
+        splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=100)
+        texts = splitter.split_documents(documents)
+        for i, text in enumerate(texts):
+            collection.add(
+                documents=[text.page_content],
+                metadatas=[{"source": text.metadata.get("source", "company_docs")}],
+                ids=[f"doc_{i}"]
+            )
+
+def get_context(query, k=3):
+    if len(query.split()) <= 2:
+        return ""
+    try:
+        results = collection.query(query_texts=[query], n_results=k)
+        if results and results.get('documents'):
+            return "\n".join(results['documents'][0])
+    except:
+        return ""
+    return ""
+def get_user_id(email: str) -> int | None:
+    """Fetch user id (integer) from Supabase using email."""
+    try:
+        res = supabase.table("user_perms").select("id").eq("email", email).execute()
+        if res.data:
+            return int(res.data[0]["id"])
+    except Exception as e:
+        print("⚠ get_user_id error:", e)
+    return None
+
+
+def get_user_role(email):
+    """Fetch user role from Supabase; default to 'Employee'."""
+    try:
+        res = supabase.table("user_perms").select("role").eq("email", email).execute()
+        return res.data[0].get("role", "Employee") if res.data else "Employee"
+    except:
+        return "Employee"
+
+def needs_database_query(llm_response):
+    """Determine if we need to query the database (LLM hints only)."""
+    triggers = [
+        "check the database",
+        "look up in the system",
+        "query the records",
+        "i don't have that information",
+        "data shows",
+        "fetch from database",
+        "from db",
+        "from database",
+    ]
+    return any(trigger in llm_response.lower() for trigger in triggers)
+
+def explain_database_results(user_input, db_results, user_context):
+    """Convert raw DB results to natural language (LLM not restricted)."""
+    prompt = f"""Convert these database results into a friendly response:
+User asked: "{user_input}"
+User context: {user_context}
+Database results:
+{db_results}
+Respond in 1-4 paragraphs using natural language, focusing on the key information.
+respond in summary not in too long responce
+if user ask for all project details give all project details alocated to that user"""
+    return call_openrouter([
+        {"role": "system", "content": "You are a helpful assistant that explains data."},
+        {"role": "user", "content": prompt}
+    ])
+
+# ---------------- build messages ----------------
+def build_messages(user_input, context, memory):
+    name = memory.get("user_name", "")
+    if name:
+        user_input = f"{name} asked: {user_input}"
+
+    if context:
+        prompt = (
+            "You are a helpful assistant. Your job is to answer the user question first, clearly and directly.\n"
+            "Context may contain facts from company documents. Do not ignore the question. Do not apologize unless wrong."
+            """
+    Format Supabase query results into a clean, human-readable response.
+    Dynamically adjusts structure based on query type and dataset.
+    Parameters:
+        data (list[dict]): List of records from Supabase query.
+        query_type (str): Type of query (projects, employees, memory, general).
+    Returns:
+        str: Formatted response for the chatbot.
+    """
+        )
+        user_message = f"Context:\n{context}\n\n{user_input}"
+    else:
+        prompt = (
+            "do not make fack information and  do not give fack data."
+            "You are a helpful assistant. Always answer the user's question clearly. "
+            "Use your general knowledge if no internal documents are available."
+        )
+        user_message = user_input
+
+    session.setdefault("chat_history", [])
+    session["chat_history"].append({"role": "user", "content": user_input})
+    session["chat_history"] = session["chat_history"][-5:]
+    messages = [{"role": "system", "content": prompt}]
+    messages.extend(session["chat_history"])
+    return messages
+
+# ---------------- OpenRouter ----------------
+# def call_openrouter(messages, temperature=0.5, max_tokens=300):
+#     """Centralized call to OpenRouter with error handling."""
+#     try:
+#         res = requests.post(
+#             "https://openrouter.ai/api/v1/chat/completions",
+#             headers={
+#                 "Authorization": f"Bearer {'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'}",
+#                 "Content-Type": "application/json"
+#             },
+#             json={
+#                 "model": "mistralai/mistral-7b-instruct",
+#                 "messages": messages,
+#                 "temperature": temperature,
+#                 "max_tokens": max_tokens
+#             },
+#             timeout=15
+#         )
+#         if res.status_code != 200:
+#             print(f"⚠ OpenRouter API error {res.status_code}: {res.text}")
+#             return None
+#         data = res.json()
+#         if "choices" not in data:
+#             print("⚠ Missing 'choices' in API response:", data)
+#             return None
+#         return data["choices"][0]["message"]["content"]
+#     except Exception as e:
+#         print("❌ Exception calling OpenRouter:", e)
+#         traceback.print_exc()
+#         return None
+
+# ---------------- Helpers for Supabase filtering ----------------
+def _is_int_like(val):
+    """Return True if value represents an integer (so we should use eq instead of ilike)."""
+    try:
+        if isinstance(val, int):
+            return True
+        s = str(val).strip()
+        return re.fullmatch(r"-?\d+", s) is not None
+    except:
+        return False
+
+def _apply_filter(query, field, value):
+    """
+    Apply type-aware filter to a supabase query builder:
+      - arrays (list or dict{'contains':...}) -> .contains
+      - ints -> .eq
+      - small tokens (<=4 chars) -> prefix ilike
+      - longer strings -> fuzzy ilike
+      - dict with start/end -> date range handling via gte/lte
+    """
+    # arrays / contains
+    if isinstance(value, dict) and "contains" in value:
+        contains_val = value["contains"]
+        if isinstance(contains_val, list):
+            for v in contains_val:
+                query = query.contains(field, [v])
+        else:
+            query = query.contains(field, [contains_val])
+        return query
+
+    # date range
+    if isinstance(value, dict) and ("start" in value or "end" in value):
+        if "start" in value and value["start"]:
+            query = query.gte(field, value["start"])
+        if "end" in value and value["end"]:
+            query = query.lte(field, value["end"])
+        return query
+
+    # numeric exact match
+    if _is_int_like(value):
+        try:
+            return query.eq(field, int(str(value).strip()))
+        except:
+            pass
+
+    # string fuzzy/prefix
+    if isinstance(value, str):
+        v = value.strip()
+        if len(v) <= 4:
+            return query.ilike(field, f"{v}%")
+        else:
+            return query.ilike(field, f"%{v}%")
+
+    # fallback equality
+    return query.eq(field, value)
+
+# ---------------- AI Query Parsing (LLM-driven) ----------------
+def parse_user_query(llm_output: str, project_id: str = None):
+    try:
+        if project_id and llm_output and "project detail" in llm_output.lower():
+            return {
+                "operation": "select",
+                "table": "projects",
+                "filters": {"uuid": project_id},
+                "fields": ["*"],
+                "limit": 1
+            }
+
+        if not llm_output or "{" not in llm_output:
+            raise ValueError("No JSON object found in output")
+
+        match = re.search(r"\{.*\}", llm_output, re.DOTALL)
+        if not match:
+            raise ValueError("No JSON object found in output")
+
+        json_str = match.group(0)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            fixed = json_str.replace("'", '"')
+            fixed = re.sub(r",\s*}", "}", fixed)
+            fixed = re.sub(r",\s*]", "]", fixed)
+            return json.loads(fixed)
+
+    except Exception as e:
+        print(f"❌ parse_user_query error: {e}")
+        print(f"Raw output:\n{llm_output}")
+        return None
+
+# ---------------- LLM response ----------------
+# def llm_response(user_input):
+#     memory = load_memory()
+#     memory = update_user_memory(user_input, memory)
+#     save_memory(memory)
+
+#     parsed = parse_user_query(user_input)
+#     if parsed.get("operation") == "none":
+#         return {"reply": "🤖 I couldn't understand that request. Can you rephrase it?"}
+
+#     reply = query_supabase(parsed)
+#     session({"role": "assistant", "content": reply})
+#     return {"reply": reply}
+
+def llm_response(user_input):
+    memory = load_memory()
+    memory = update_user_memory(user_input, memory)
+    save_memory(memory)
+
+    parsed = parse_user_query(user_input or "")
+    if not parsed:
+        return {"reply": "🤖 I couldn't understand that request. Can you rephrase it?"}
+
+    if parsed.get("operation") == "none":
+        return {"reply": "🤖 I couldn't understand that request. Can you rephrase it?"}
+
+    reply = query_supabase(parsed)
+    # append assistant reply to session chat_history
+    session.setdefault("chat_history", [])
+    session["chat_history"].append({"role": "assistant", "content": reply})
+    session["chat_history"] = session["chat_history"][-20:]
+    return {"reply": reply}
+
+
+# --- Greeting prompt handling logic ---
+def handle_greetings(user_message: str, user_name: str = None):
+    """
+    Return a greeting reply ONLY when the user's message is a short/pure greeting.
+    If user_message contains question words or longer content, return None so the main flow proceeds.
+    """
+    text = (user_message or "").strip()
+    if not text:
+        return None
+
+    # quick normalization
+    normalized = text.lower()
+
+    # Patterns that indicate greeting words
+    greeting_words = ["hi", "hello", "hey", "gm", "ga", "ge", "good morning", "good afternoon", "good evening"]
+
+    # Words that indicate a question/intent — if present, we should NOT treat it as pure greeting
+    intent_indicators = ["?", "can", "could", "would", "please", "project", "details", "all", "give", "show", "help", "how", "what", "who", "where", "when", "why"]
+
+    # If message contains any intent indicator, do not return greeting
+    if any(ind in normalized for ind in intent_indicators):
+        return None
+
+    # If the message is longer than 4 words, assume it's not a pure greeting
+    if len(normalized.split()) > 4:
+        return None
+
+    # If message contains a greeting word, return a friendly greeting
+    if any(g in normalized for g in greeting_words):
+        current_hour = datetime.now().hour
+        tod = "day"
+        if current_hour < 12:
+            tod = "morning"
+        elif current_hour < 18:
+            tod = "afternoon"
+        else:
+            tod = "evening"
+
+        if user_name:
+            templates = [
+                f"Good {tod}, {user_name}! How can I help you?",
+                f"Hey {user_name}! What would you like help with today?",
+                f"Hi {user_name}! How's your {tod} going?"
+            ]
+        else:
+            templates = [
+                f"Good {tod}! How can I help you?",
+                "Hey there! What can I do for you?",
+                "Hi! How can I assist?"
+            ]
+        return random.choice(templates)
+
+    return None
+
+
+# ====================== STRONG ROLE-BASED QUERY FILTERING ======================
+def _apply_access_controls(table: str, query, role: str, user_email: str):
+    """
+    Enforce RBAC/IBAC ONLY on Supabase data fetching.
+    Rules:
+      - Admin: unrestricted across all tables.
+      - HR: unrestricted for 'projects' and 'employee_login'.
+      - Manager: 'projects' restricted to those they manage (leader_of_project contains user_email).
+      - Employee/Other: 'projects' where assigned_to_emails contains user_email;
+                        'employee_login' only their own record.
+      - Other tables: no additional restrictions (unless specified above).
+    """
+    r = (role or "Employee").strip().lower()
+    t = (table or "").strip().lower()
+
+    # Admin: no restriction
+    if r == "admin":
+        return query
+
+    # HR: unrestricted on projects and employee_login
+    if r == "hr":
+        return query
+
+    # Manager: restrict projects to those they lead
+    if r == "manager":
+        if t == "projects":
+            return query.contains("leader_of_project", [user_email])
+        if t == "employee_login":
+            # Not specified: default to self only
+            return query.eq("email", user_email)
+        return query
+
+    # Employee/Other: strict
+    if r in ["employee", "other"]:
+        if t == "projects":
+            return query.contains("assigned_to_emails", [user_email])
+        if t == "employee_login":
+            return query.eq("email", user_email)
+        return query
+
+    # Fallback: treat as Employee
+    if t == "projects":
+        return query.contains("assigned_to_emails", [user_email])
+    if t == "employee_login":
+        return query.eq("email", user_email)
+    return query
+
+
+
+def format_results_as_table(data: list[dict]) -> str:
+    """
+    Converts list of dicts into a Markdown table string.
+    """
+    if not data:
+        return "⚠ No matching records found."
+
+    # Extract headers
+    headers = list(data[0].keys())
+
+    # Build markdown table
+    table = "| " + " | ".join(headers) + " |\n"
+    table += "| " + " | ".join(["---"] * len(headers)) + " |\n"
+
+    for row in data:
+        row_vals = [str(row.get(h, "")) for h in headers]
+        table += "| " + " | ".join(row_vals) + " |\n"
+
+    return table
+
+def query_supabase(parsed):
+    """
+    Run a structured query against Supabase with proper projectId handling.
+    - For 'projects': always use incoming project_id if provided, fallback to session.
+    - For other tables: keep existing role-based access control.
+    """
+    try:
+        table = parsed.get("table")
+        filters = parsed.get("filters", {}) or {}
+        limit = parsed.get("limit", 10)
+        fields = parsed.get("fields", ["*"])
+        user_email = session.get("user_email")
+        user_role = get_user_role(user_email)
+
+        # --- Sync project_id from request or session ---
+        incoming_project_id = filters.pop("id", None)
+        if incoming_project_id:
+            session["current_project_id"] = incoming_project_id
+            project_id = incoming_project_id
+        else:
+            project_id = session.get("current_project_id")
+            
+        project_id = filters.get("uuid") or filters.get("uuid") or parsed.get("project_id") or session.get("current_project_id")
+
+
+        print(f"🔍 Query request: table={table}, filters={filters}, role={user_role}, email={user_email}, project_id={project_id}")
+
+        # --- Build base query ---
+        select_clause = ",".join(fields) if fields != [""] else ""
+        query = supabase.table(table).select(select_clause)
+
+        # --- Handle 'projects' table specially ---
+        if table == "projects":
+            if not project_id:
+                return "⚠ No project selected."
+            if isinstance(project_id, str):
+                project_id = project_id.strip()
+            
+            print(f"🧾 Cleaned project_id value: '{project_id}'")
+
+
+            query = query.eq("uuid", project_id)
+
+        else:
+            # --- Apply user-specified filters ---
+            free_text = None
+            if "free_text" in filters:
+                free_text = str(filters.pop("free_text")).strip()
+            for field, value in filters.items():
+                if value in [None, ""]:
+                    continue
+                query = _apply_filter(query, field, value)
+
+            # --- Apply role-based access only for non-project tables ---
+            if table in ACCESS_CONTROLLED and table != "projects":
+                query = _apply_access_controls(table, query, user_role, user_email)
+
+            # --- Free-text search across text-safe columns ---
+            if free_text:
+                cols = _text_cols(table)
+                if cols:
+                    or_parts = [f"{c}.ilike.%{free_text}%" for c in cols]
+                    or_clause = ",".join(or_parts)
+                    query = query.or_(or_clause)
+
+        # --- Execute query ---
+        # --- Execute query ---
+        result = query.limit(limit).execute()
+        print("📊 Supabase raw result:", result)
+        data = result.data or []
+
+        
+
+        if not data:
+            return "⚠ No matching records found."
+
+        # --- Format results ---
+        formatted = []
+        for row in data:
+            details = []
+            for k, v in row.items():
+                if v in [None, "", [], {}]:
+                    continue
+                if isinstance(v, (list, dict)):
+                    try:
+                        v = json.dumps(v, ensure_ascii=False)
+                    except:
+                        v = str(v)
+                details.append(f"{k.replace('_', ' ').title()}: {v}")
+            formatted.append("• " + "\n  ".join(details))
+
+        return "\n\n---\n\n".join(formatted)
+
+    except Exception as e:
+        print("❌ Supabase error:", e)
+        traceback.print_exc()
+        return f"❌ Supabase error: {str(e)}"
+
+# =============================================================================================================================================================
+# ============================================================common chatbot functions===================================================================================
+# ==============================================================================================================================================================
+
+# ---------------- Memory Store ----------------
+MEMORY_FILE = "memory.json"
+
+def load_mem():
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_mem(mem):
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(mem, f, indent=2, ensure_ascii=False)
+
+# memory schema: { "<user_email>": { "facts": [...], "last_seen": "ISO" } }
+user_memory = load_mem()
+
+def remember(user_email: str, text: str):
+    """
+    Extract simple user facts like name, preferences.
+    """
+    if not user_email:
+        return
+    entry = user_memory.get(user_email, {"facts": [], "last_seen": None})
+
+    patterns = [
+        r"\bmy name is\s+([A-Za-z][A-Za-z\s\-]{1,40})",
+        r"\bi am\s+([A-Za-z][A-Za-z\s\-]{1,40})",
+        r"\bi'm\s+([A-Za-z][A-Za-z\s\-]{1,40})",
+        r"\bi like\s+([A-Za-z0-9 ,.&\-]{1,60})",
+        r"\bmy role is\s+([A-Za-z][A-Za-z\s\-]{1,40})",
+        r"\bcall me\s+([A-Za-z][A-Za-z\s\-]{1,40})",
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            fact = m.group(0).strip()
+            if fact not in entry["facts"]:
+                entry["facts"].append(fact)
+
+    entry["last_seen"] = datetime.now(timezone.utc).isoformat()
+    user_memory[user_email] = entry
+    save_mem(user_memory)
+
+def get_user_role(email: str) -> str:
+    """
+    Fetch role for a user from Supabase (table: user_perms with columns: email, role).
+    Defaults to 'Employee' if no row found.
+    """
+    try:
+        res = supabase.table("user_perms").select("role").eq("email", email).limit(1).execute()
+        if res.data and isinstance(res.data, list) and len(res.data) > 0:
+            role = (res.data[0].get("role") or "").strip()
+            return role if role else "Employee"
+    except Exception as e:
+        print("Supabase role fetch error:", e)
+    return "Employee"
+
+
+
+# ---------------- LLM ----------------
+# def call_openrouter(messages, model='openai/gpt-4o-mini', temperature=0.5, max_tokens=300):
+#     url = "https://openrouter.ai/api/v1/chat/completions"
+#     mdl = model or os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+
+#     headers = {
+#         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+#         "Content-Type": "application/json"
+#     }
+#     payload = {
+#         "model": mdl,
+#         "messages": messages,
+#         "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", temperature)),
+#         "max_tokens": max_tokens
+#     }
+#     try:
+#         resp = requests.post(url, headers=headers, json=payload, timeout=30)
+#         data = resp.json()
+#         if resp.status_code != 200:
+#             print("OpenRouter error:", resp.status_code, data)
+#             return f"⚠ LLM error: {data.get('error', {}).get('message', 'Unknown error')}"
+#         return data["choices"][0]["message"]["content"].strip()
+#     except Exception as e:
+#         print("OpenRouter exception:", e)
+#         return f"⚠ LLM exception: {str(e)}"
+
+def call_openrouter(messages, model=None, temperature=0.5, max_tokens=300):
+    """
+    Centralized OpenRouter call — uses OPENROUTER_API_KEY from env.
+    Returns the assistant text or None on failure.
+    """
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    mdl = model or os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": mdl,
+        "messages": messages,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens)
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        data = resp.json()
+        if resp.status_code != 200:
+            print("OpenRouter error:", resp.status_code, data)
+            return None
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print("OpenRouter exception:", e)
+        traceback.print_exc()
+        return None
+
+# ---------------- Smalltalk Helpers ----------------
+CONFUSION = [
+    "Hmm, could you rephrase that?",
+    "I didn’t quite get that — can you clarify?",
+    "Can you share a bit more detail?",
+]
+
+def greet_reply(name=None):
+    tod = "day"
+    h = datetime.now().hour
+    if h < 12: tod = "morning"
+    elif h < 18: tod = "afternoon"
+    else: tod = "evening"
+    base = f"Good {tod}"
+    return f"{base}, {name}!" if name else f"{base}! How can I help you?"
+
+def maybe_greeting(text):
+    t = text.lower().strip()
+    if re.search(r"\b(hi|hello|hey|good\s*(morning|afternoon|evening)|gm|ga|ge)\b", t):
+        return True
+    return False
+
+
+
+
+# # ---------------- Secure Messaging Endpoint ----------security-------------------
+
+# @app.route('/api/secure-message', methods=['POST'])
+# def secure_message():
+#     """
+#     Endpoint for sending and receiving encrypted messages.
+#     Request: { "action": "encrypt|", "message": "..." }
+#     """
+#     try:
+#         data = request.get_json()
+#         action = data.get('action', '').lower()
+#         message = data.get('message', '')
+        
+#         if not message:
+#             return jsonify({"error": "Message is required"}), 400
+            
+#         if action == 'encrypt':
+#             # Encrypt the message
+#             encrypted_data = encrypt_chat_message(message)
+#             return jsonify({
+#                 "status": "encrypted",
+#                 "data": encrypted_data
+#             })
+#         else:
+#             # Decrypt the message
+#             try:
+#                 decrypted = decrypt_chat_message(message if isinstance(message, dict) else json.loads(message))
+#                 return jsonify({
+#                     "status": "decrypted",
+#                     "data": decrypted
+#                 })
+#             except Exception as e:
+#                 return jsonify({"error": "Decryption failed. Invalid message format or key."}), 400
+                
+#     except Exception as e:
+        # return jsonify({"error": str(e)}), 500
+
+# ---------------- Routes ----------------
+
+
+#the user facts route-------------
+
+
+# @app.route("/chat", methods=["POST"])
+# def chat():
+#     data = request.json
+#     user_email = data.get("email")  # 👈 use 'email' from frontend
+#     user_input = data.get("message")
+
+#     if not user_email:
+#         return jsonify({"error": "Email (user_id) missing"}), 400
+
+#     # 🔹 Fetch user facts
+#     user_facts = get_user_facts(user_email)
+#     if "name" in user_facts:
+#         print(f"👋 Welcome back {user_facts['name']}!")
+
+#     # 🔹 Detect and save facts
+#     text_lower = user_input.lower()
+#     if "my name is" in text_lower:
+#         name = user_input.split("is")[-1].strip().split()[0]
+#         store_user_fact(user_email, "name", name)
+
+#     if "i work as" in text_lower:
+#         role = user_input.split("as")[-1].strip()
+#         store_user_fact(user_email, "role", role)
+
+#     # 🧠 Continue your existing chatbot logic (RAG / LLM / Supabase query)
+#     response = generate_chatbot_response(user_input, user_email)
+
+#     return jsonify({"response": response})
+
+
+#end of user facts route
+
+
+@app.route("/set_session", methods=["POST"])
+def set_session():
+    if not verify_api_key():
+        return jsonify({"reply": "❌ Unauthorized"}), 401
+    try:
+        data = request.get_json()
+        email = (data.get("email") or "").strip()
+        name = (data.get("name") or "").strip()
+        if email:
+            session["user_email"] = email
+            session["user_name"] = name
+            return jsonify({"message": "✅ Session set."})
+        return jsonify({"error": "❌ Email is required."}), 400
+    except Exception as e:
+        return jsonify({"error": f"Failed to set session: {str(e)}"}), 500
+
+
+@app.route("/debug_session",methods=["GET"])
+def debug_session():
+   return jsonify({
+         "user_email": session.get("user_email"),
+         "user_name": session.get("user_name")
+    })
+
+@app.route("/get_user_project", methods=["POST"])
+def get_user_project():
+    if not verify_api_key():
+        return jsonify({"reply": "❌ Unauthorized"}), 401
+    try:
+        data = request.get_json() or {}
+        user_email = data.get("email")
+        
+        print(f"🔍 Getting project for user: {user_email}")
+        
+        if not user_email:
+            return jsonify({"error": "Email is required"}), 400
+        
+        # Get user's assigned projects from database
+        try:
+            result = supabase.table("projects").select("uuid, project_name, project_description").contains("assigned_to_emails", [user_email]).execute()
+            
+            if result.data and len(result.data) > 0:
+                # Return the first project with full details
+                project = result.data[0]
+                project_id = project["uuid"]
+                project_name = project["project_name"]
+                project_description = project.get("project_description", "")
+                
+                print(f"🔍 Found project for {user_email}: ID={project_id}, Name={project_name}")
+                
+                return jsonify({
+                    "project_id": str(project_id),  # Ensure it's a string
+                    "project_name": project_name,
+                    "project_description": project_description,
+                    "full_project_info": project,
+                    "message": "Project found"
+                })
+            else:
+                print(f"🔍 No projects found for {user_email}")
+                return jsonify({
+                    "project_id": "default",
+                    "project_name": "Default Project",
+                    "project_description": "No assigned projects",
+                    "message": "No assigned projects found"
+                })
+        except Exception as e:
+            print(f"Database error: {e}")
+            return jsonify({
+                "project_id": "default",
+                "project_name": "Default Project",
+                "message": "Database error"
+            })
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+@app.route("/get_chat_id", methods=["POST"])
+def get_chat_id():
+    data = request.get_json(force=True)
+    project_id = data.get("project_id")
+    email = data.get("email")
+
+    if not project_id or not email:
+        return jsonify({"error": "Missing data"}), 400
+
+    try:
+        user = supabase.table("user_perms").select("id").eq("email", email).execute()
+        user_id = user.data[0]["id"] if user.data else None
+
+        # Check if already exists
+        existing = (
+            supabase.table("chat_id_counters")
+            .select("chat_id")
+            .eq("project_id", project_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        if existing.data:
+            return jsonify({"chat_id": existing.data[0]["chat_id"]})
+
+        # Create new chat_id if not exists
+        new_chat_id = f"{email}_{project_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        supabase.table("chat_id_counters").insert({
+            "project_id": project_id,
+            "chat_id": new_chat_id,
+            "user_id": user_id
+        }).execute()
+        return jsonify({"chat_id": new_chat_id})
+
+    except Exception as e:
+        print("❌ Error fetching chat_id:", e)
+        return jsonify({"chat_id": "default"})
+
+@app.route("/debug_projects", methods=["GET"])
+def debug_projects():
+    if not verify_api_key():
+        return jsonify({"reply": "❌ Unauthorized"}), 401
+    try:
+        # Get all projects from database for debugging
+        result = supabase.table("projects").select("*").execute()
+        
+        return jsonify({
+            "total_projects": len(result.data) if result.data else 0,
+            "projects": result.data or [],
+            "message": "All projects retrieved"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# =============================================================================================================================================================
+# ============================================================common chatbot sessions===================================================================================
+# ==============================================================================================================================================================
+
+@app.route("/chat/common", methods=["POST"])
+def common_chat():
+    if not verify_api_key():
+        return jsonify({"reply": "❌ Unauthorized"}), 401
+    try:
+        payload = request.get_json(silent=True) or {}
+        print("📥 Incoming payload:", payload)
+
+        user_query = (payload.get("query") or payload.get("message") or "").strip()
+        normalized_query = call_openrouter([
+            {"role": "system", "content": "Rewrite the user's query into a clear natural-language question."},
+            {"role": "user", "content": user_query}
+        ], temperature=0, max_tokens=50) or user_query
+
+        project_id = payload.get("project_id") or "default"
+
+        # -------------------------------
+        # 0. Auth checks
+        # -------------------------------
+        user_email = session.get("user_email")
+        chat_id = (
+            payload.get("chat_id")
+            or f"{session.get('user_email', 'guest')}_{project_id}")
+        session["chat_id"] = chat_id
+        session["project_id"] = project_id
+        user_name = session.get("user_name", "")
+        if not user_email:
+            return jsonify({"reply": "❌ Please login first. Session email not found."}), 401
+        if not user_query:
+            return jsonify({"reply": random.choice(CONFUSION)}), 400
+
+        # -------------------------------
+        # 1. Project-related queries
+        # -------------------------------
+        intent = detect_intent(user_query)
+
+        if intent == "project_details" and project_id:
+            parsed = {
+                "operation": "select",
+                "table": "projects",
+                "fields": ["*"],
+                "filters": {"id": project_id}
+            }
+            return jsonify({"reply": query_supabase(parsed), "intent": intent})
+
+        elif intent == "all_projects":
+            parsed = {"operation": "select", "table": "projects", "fields": ["*"], "filters": {}}
+            return jsonify({"reply": query_supabase(parsed), "intent": intent})
+
+        # -------------------------------
+        # 2. Document context (RAG chunks)
+        # -------------------------------
+        doc_context = get_context(user_query)
+
+        # -------------------------------
+        # 3. System message
+        # -------------------------------
+        role = get_user_role(user_email)
+        facts = user_memory.get(user_email, {}).get("facts", [])
+
+        # Start with the system message
+        system_message = (
+            "You are a helpful AI assistant for our company.\n\n"
+            f"Current user: {user_name} ({user_email}), Role: {role}.\n"
+            f"Known facts: {facts if facts else 'None'}.\n"
+        )
+
+        # Append doc_context safely
+        if doc_context:
+            system_message += "\nRelevant documents:\n" + str(doc_context) + "\n"
+
+        # Append database tables safely
+        tables_json = json.dumps({table: list(cols) for table, cols in TABLES.items()}, indent=2)
+        system_message += "\nAvailable database tables:\n" + tables_json + "\n"
+
+        # Append final instructions
+        system_message += "Respond conversationally, clear, concise (3–4 line summaries)."
+
+
+
+# -------------------------------
+        # 4. Conversation history
+        # -------------------------------
+        conv_hist = load_chat_history(user_email,project_id,chat_id, limit=15)
+
+        messages = [
+            {"role": "system", "content": system_message},
+            *conv_hist,
+            {"role": "user", "content": user_query}
+        ]
+
+        # -------------------------------
+        # 5. LLM response
+        # -------------------------------
+        reply = call_openrouter(messages, temperature=0.6, max_tokens=1200) or "⚠ No response."
+
+        # -------------------------------
+        # 6. Save chat + memory
+        # -------------------------------
+        remember(user_email, user_query)
+        save_chat_message(user_email, "user", user_query, project_id, chat_id)
+        save_chat_message(user_email, "assistant", reply, project_id, chat_id)
+
+
+        return jsonify({
+            "reply": reply,
+            "intent": intent,
+            "user": {"email": user_email, "name": user_name, "role": role},
+            "memory_facts": facts
+        })
+
+    except Exception as e:
+        print("Chat error:", traceback.format_exc())
+        return jsonify({"reply": f"⚠ Error: {str(e)}"}), 500
+
+
+# =============================================================================================================================================================
+# ============================================================work chatbot sessions===================================================================================
+# ==============================================================================================================================================================
+
+#user facts route-------------
+
+# =========================================================
+# 🔹 USER FACTS MANAGEMENT (for Supabase table: user_facts)
+# =========================================================
+
+def get_user_facts(user_email):
+    """
+    Fetch all stored facts for a user (from Supabase table 'user_facts')
+    Returns a dict like {"name": "Zeel", "role": "AI Developer"}
+    """
+    try:
+        response = supabase.table("user_facts").select("fact_key, fact_value").eq("user_id", user_email).execute()
+        if not response.data:
+            return {}
+
+        facts_dict = {item["fact_key"]: item["fact_value"] for item in response.data}
+        return facts_dict
+    except Exception as e:
+        print(f"⚠ Error fetching user facts: {e}")
+        return {}
+
+
+def store_user_fact(user_email, fact_key, fact_value, confidence=1.0):
+    """
+    Insert or update a single fact in Supabase 'user_facts'
+    """
+    try:
+        # Check if fact already exists
+        existing = supabase.table("user_facts").select("id").eq("user_id", user_email).eq("fact_key", fact_key).execute()
+        
+        if existing.data and len(existing.data) > 0:
+            # Update existing record
+            fact_id = existing.data[0]["id"]
+            supabase.table("user_facts").update({
+                "fact_value": fact_value,
+                "confidence": confidence,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }).eq("id", fact_id).execute()
+            print(f"🔄 Updated fact: {fact_key} = {fact_value}")
+        else:
+            # Insert new record
+            supabase.table("user_facts").insert({
+                "user_id": user_email,
+                "fact_key": fact_key,
+                "fact_value": fact_value,
+                "confidence": confidence,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }).execute()
+            print(f"✅ New fact stored: {fact_key} = {fact_value}")
+
+    except Exception as e:
+        print(f"❌ Error storing user fact: {e}")
+
+
+
+def extract_and_store_user_facts(user_email: str, text: str):
+    """
+    Extract key user facts from free-form chat text and persist them to Supabase.
+    Captures: name, role/title, age, experience years, location, company, phone, email, likes.
+    """
+    if not user_email or not text:
+        return
+    try:
+        candidates = []
+        # Helper: sanitize and limit
+        def clean(val: str, limit: int = 120) -> str:
+            v = (val or "").strip()
+            v = re.sub(r"\s+", " ", v)
+            return v[:limit]
+        # Name
+        m = re.search(r"\b(?:my name is|i am|i'm|this is|call me)\s+([A-Za-z][A-Za-z\s\-]{1,40})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("name", clean(m.group(1).rstrip(".,"))))
+
+        # Role / Title
+        m = re.search(r"\b(?:i work as|my role is|i am a|i'm a)\s+([A-Za-z][A-Za-z\s\-/]{1,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("role", clean(m.group(1).rstrip(".,"))))
+
+        # Age
+        m = re.search(r"\b(?:i am|i'm)\s+(\d{1,2})\s*(?:years old|yrs old|yo|years)?\b", text, re.IGNORECASE)
+        if m:
+            candidates.append(("age", clean(m.group(1))))
+
+        # Experience in years
+        m = re.search(r"\b(?:i have|i've)\s+(\d{1,2})\s+(?:years|yrs)\s+of\s+(?:experience|exp)\b", text, re.IGNORECASE)
+        if m:
+            candidates.append(("experience_years", clean(m.group(1))))
+
+        # Location / City
+        m = re.search(r"\b(?:i live in|i am from|i'm from|based in)\s+([A-Za-z][A-Za-z\s\-]{1,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("location", clean(m.group(1).rstrip(".,"))))
+
+        # Company / Employer
+        m = re.search(r"\b(?:i work at|i work for|my company is)\s+([A-Za-z0-9][A-Za-z0-9\s&\-]{1,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("company", clean(m.group(1).rstrip(".,"))))
+
+        # Phone number
+        m = re.search(r"\b(?:my phone|my number|phone number)\s*[:is]*\s*(\+?\d[\d\-\s]{7,15}\d)\b", text, re.IGNORECASE)
+        if m:
+            candidates.append(("phone", re.sub(r"\s+", "", m.group(1)).strip()))
+
+        # Email address
+        m = re.search(r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", text)
+        if m:
+            candidates.append(("email", clean(m.group(1))))
+
+        # Likes / preferences
+        m = re.search(r"\bi like\s+([A-Za-z0-9 ,.&\-]{1,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("likes", clean(m.group(1).rstrip(".,"))))
+
+        # Current task / work focus
+        m = re.search(r"\b(?:i am working on|i'm working on|currently working on|my work is|i'm doing|i work on)\s+(.{5,120})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("current_task", clean(m.group(1))))
+
+        # Responsibilities / areas
+        m = re.search(r"\b(?:i am responsible for|my responsibilities (?:are|include)|i handle)\s+(.{5,120})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("responsibilities", clean(m.group(1))))
+
+        # Skills
+        m = re.search(r"\b(?:my skills (?:are|include)|skills:?)\s+([A-Za-z0-9 ,.&\-]{3,160})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("skills", clean(m.group(1), limit=160)))
+
+        # Tools / stack
+        m = re.search(r"\b(?:i use|tools:|tech stack:|stack:|we use|i work with)\s+([A-Za-z0-9 ,.&\-/]{3,160})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("tools", clean(m.group(1), limit=160)))
+
+        # Work in domain/department
+        m = re.search(r"\b(?:i work in)\s+([A-Za-z][A-Za-z\s\-/]{2,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("department", clean(m.group(1))))
+
+        # Department / team
+        m = re.search(r"\b(?:my department is|department:|i'm in the)\s+([A-Za-z][A-Za-z\s\-/]{2,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("department", clean(m.group(1))))
+
+        # Manager / reports to
+        m = re.search(r"\b(?:my manager is|i report to)\s+([A-Za-z][A-Za-z\s\-]{2,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("manager", clean(m.group(1))))
+
+        # Team name
+        m = re.search(r"\b(?:my team is|team:|i'm on the)\s+([A-Za-z][A-Za-z\s\-]{2,60})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("team", clean(m.group(1))))
+
+        # Availability hours
+        m = re.search(r"\b(?:i am available|availability is|available from)\s+([0-9:APMapm\-\s]{5,40})", text)
+        if m:
+            candidates.append(("availability_hours", clean(m.group(1))))
+
+        # Timezone
+        m = re.search(r"\b(?:timezone|time zone)\s*[:is]*\s*([A-Za-z/_+\-0-9]{3,32})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("timezone", clean(m.group(1))))
+
+        # Languages
+        m = re.search(r"\b(?:i speak|languages?:)\s+([A-Za-z ,\-]{3,80})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("languages", clean(m.group(1))))
+
+        # Goals / objectives
+        m = re.search(r"\b(?:my goal is|my goals are|i want to)\s+(.{5,120})", text, re.IGNORECASE)
+        if m:
+            candidates.append(("goals", clean(m.group(1))))
+
+        # Persist
+        for key, value in candidates:
+            if value:
+                store_user_fact(user_email, key, value)
+    except Exception as e:
+        print(f"⚠ extract_and_store_user_facts error: {e}")
+
+
+
+# Start of work chat route
+
+
+@app.route("/chat/work", methods=["POST"])
+def work_chat():
+    if not verify_api_key():
+        return jsonify({"reply": "❌ Unauthorized"}), 401
+
+    try:
+        data = request.get_json(force=True) or {}
+        print("📥 Incoming data:", data)
+
+        # -------------------- Extract session/user data --------------------
+        user_input = (data.get("query") or data.get("message") or "").strip()
+        project_id = data.get("project_id")
+        session["project_uuid"] = project_id
+        user_email = session.get("user_email")
+        user_name = session.get("user_name", "")
+        user_role = get_user_role(user_email)
+
+        if not project_id:
+            return jsonify({"reply": "⚠ No project selected."})
+        if not user_email:
+            return jsonify({"reply": "❌ Please login first."})
+        if not user_input:
+            return jsonify({"reply": random.choice(CONFUSION_RESPONSES)})
+
+    
+        # -------------------- 🔹 Fetch user facts from Supabase --------------------
+        user_facts = get_user_facts(user_email)
+        if "name" in user_facts:
+            print(f"👋 Welcome back {user_facts['name']}!")
+
+        # -------------------- 🔹 Detect and store new user facts --------------------
+        extract_and_store_user_facts(user_email, user_input)
+
+        # -------------------- 🔹 Handle greetings first --------------------
+        greeting_response = handle_greetings(user_input, user_name)
+        if greeting_response:
+            save_chat_message(user_email, "assistant", greeting_response, project_id, session.get("chat_id", "default"))
+            return jsonify({"reply": greeting_response})
+
+        # -------------------- Normalize Query (LLM cleanup) --------------------
+        normalized_query = call_openrouter([
+            {"role": "system", "content": "You are a query refiner. Rewrite the user's query into a clear natural-language question."},
+            {"role": "user", "content": user_input}
+        ], temperature=0, max_tokens=50) or user_input
+
+        ql = normalized_query.lower()
+        if any(p in ql for p in ["facts about me", "my facts", "about me", "tell me about me"]):
+            facts = get_user_facts(user_email) or {}
+            if not facts:
+                resp = "No personal facts saved yet."
+            else:
+                resp = "Here are your saved facts:\n" + "\n".join([f"- {k}: {v}" for k, v in facts.items()])
+            save_chat_message(user_email, "assistant", resp, project_id, session.get("chat_id", "default"))
+            return jsonify({"reply": resp})
+
+        if any(p in ql for p in ["facts about company", "company facts", "about the company", "company info", "company information"]):
+            company_ctx = get_context("company information") or get_context("about the company") or "No company information found."
+            save_chat_message(user_email, "assistant", company_ctx, project_id, session.get("chat_id", "default"))
+            return jsonify({"reply": company_ctx})
+
+        # -------------------- Intent Detection --------------------
+        query_type = detect_intent(normalized_query)
+        print(f"🧭 Detected intent: {query_type}")
+
+        db_answer, doc_context, web_context = None, None, None
+
+        # -------------------- debug prints --------------------
+        print(f"[DEBUG] incoming: '{user_input}'")
+        print(f"[DEBUG] greeting_response: {bool(greeting_response)}")
+        print(f"[DEBUG] detected intent: {query_type}")
+
+
+        # -------------------- Database Lookup --------------------
+        if "project" in normalized_query.lower():
+            try:
+                filters = {"uuid": project_id}
+                if user_role.lower() == "employee":
+                    filters["assigned_to"] = user_email
+
+                parsed = {"operation": "select", "table": "projects", "fields": ["*"], "filters": filters}
+                db_answer = query_supabase(parsed)
+            except Exception as e:
+                print("❌ DB query error:",e)
+
+        # -------------------- Document Lookup (RAG) --------------------
+        try:
+            doc_context = get_context(normalized_query)
+        except Exception as e:
+            print("❌ Document lookup error:", e)
+                    
+        # Generate a persistent chat_id per user + project if not provided
+        chat_id = (
+        data.get("chat_id")
+        or f"{session.get('user_email', 'guest')}_{data.get('project_id', 'general')}")
+        session["chat_id"] = chat_id  # store in session for next time
+
+        project_id = data.get("project_id") or session.get("project_id", "default")
+        session["chat_id"] = chat_id
+        session["project_id"] = project_id
+
+             # Build conversation history
+        conv_hist = load_chat_history(user_email, project_id, chat_id, limit=15)
+        # -------------------- LLM Synthesis --------------------
+        synth_prompt = f"""
+        User asked: {normalized_query}
+        Database facts: {db_answer or "N/A"}
+        Document context: {doc_context or "N/A"}
+        Web context: {web_context or "N/A"}
+        Task:
+        - Always give a human-like, professional, natural reply.
+        - If user asked about a specific field (like timeline, client name, leader, status), answer in 1–2 sentences only.
+        - For general queries, reply in short structured bullets.
+        - Never dump raw DB rows or raw doc chunks.
+        - Always keep response concise and clear.
+        """
+
+        messages = [
+            {"role": "system", "content": f"You are a helpful AI assistant for We3Vision. User: {user_name} ({user_email}), Role: {user_role}."},
+            *conv_hist,
+            {"role": "user", "content": synth_prompt}
+        ]
+
+        reply = call_openrouter(messages, temperature=0.5, max_tokens=350)
+
+        # -------------------- Save Chat & Memory --------------------
+        remember(user_email, user_input)
+        save_chat_message(user_email, "user", user_input, project_id, chat_id)
+        save_chat_message(user_email, "assistant", reply, project_id, chat_id)
+
+        final_reply = format_response(user_input, fallback=reply)
+                    # -------------------- ✅ Run Alignment System Only for Technical Queries --------------------
+        try:
+            project_data = supabase.table("projects").select("*").execute().data
+            if is_technical_prompt(user_input, project_data):
+                check = verify_response_final(user_input, final_reply, project_data, debug=False)
+      
+            #     if check.get("alignment_score") is not None:
+            #          final_reply += f"\n\n🔹 Accuracy: {check['alignment_score']} ({check['trust_level']})"
+            #     else:
+            #         print("ℹ️ Skipped accuracy display — no valid score.")
+            # else:
+            #     print("ℹ️ Skipped alignment — Non-technical/general query.")
+        except Exception as e:
+            print(f"⚠️ Alignment system failed: {e}")
+        return jsonify({"reply": final_reply})
+
+    except Exception as e:
+        print(f"❌ Error in work_chat route: {e}")
+        return jsonify({"reply": "⚠ Something went wrong while processing your request."})
+    
+    
+    
+#END of work chat route
+
+# =============================================================================================================================================================
+# ============================================================dual chatbot sessions===================================================================================
+# ==============================================================================================================================================================
+@app.route("/chat/dual", methods=["POST"])
+def dual_chat():    
+    try:
+        data = request.get_json(force=True) or {}
+        print("📥 Incoming data:", data)
+
+        # -------------------- Extract session/user data --------------------
+        user_input = (data.get("query") or data.get("message") or "").strip()
+        project_id = data.get("project_id") or "default"
+        chat_id = data.get("chat_id") or session.get("chat_id")
+        if not chat_id:
+            chat_id = f"{user_email}_{project_id or 'default'}"
+        session["project_uuid"] = project_id
+        session["chat_id"] = chat_id
+        user_email = session.get("user_email")
+        user_name = session.get("user_name", "")
+        user_role = get_user_role(user_email)
+        
+        
+        
+        history = load_chat_history(user_email, project_id, chat_id, limit=15)
+        print(f"[DEBUG] Final chat_id resolved: {chat_id}")
+
+
+        if not project_id:
+            return jsonify({"reply": "⚠️ No project selected."})
+        if not user_email:
+            return jsonify({"reply": "❌ Please login first."})
+        if not user_input:
+            return jsonify({"reply": random.choice(CONFUSION_RESPONSES)})
+
+
+        # print_last_conversations(user_email, count=5)
+        
+
+
+        # -------------------- Handle greetings first --------------------
+        greeting_response = handle_greetings(user_input)
+        if greeting_response:
+            return jsonify({"reply": greeting_response})
+
+        # -------------------- Normalize Query (LLM cleanup) --------------------
+        normalized_query = call_openrouter([
+            {"role": "system", "content": "You are a query refiner. Rewrite the user's query into a clear natural-language question."},
+            {"role": "user", "content": user_input}
+        ], temperature=0, max_tokens=50) or user_input
+
+        # -------------------- Intent Detection --------------------
+        query_type = detect_intent(normalized_query)
+        
+        print(f"🧭 Detected intent: {query_type}")
+        if detect_intent == "other":
+            reply = llm_web_fallback(user_input, user_email)
+        else:
+            reply = call_openrouter([
+                {"role": "system", "content": "You are a helpful project assistant."},
+                {"role": "user", "content": user_input}
+                ])
+
+
+        db_answer, doc_context, web_context = None, None, None
+
+        # -------------------- Database Lookup --------------------
+        if "project" in normalized_query.lower():
+            try:
+                filters = {"uuid": project_id}
+                if user_role.lower() == "employee":
+                    filters["assigned_to"] = user_email
+
+                parsed = {"operation": "select", "table": "projects", "fields": ["*"], "filters": filters}
+                db_answer = query_supabase(parsed)
+            except Exception as e:
+                print("❌ DB query error:", e)
+
+        # -------------------- Document Lookup (RAG) --------------------
+        try:
+            doc_context = get_context(normalized_query)
+        except Exception as e:
+            print("❌ Document lookup error:", e)
+
+             # Build conversation history
+        conv_hist = load_chat_history(user_email, limit=5)
+
+        # -------------------- LLM Synthesis --------------------
+        synth_prompt = f"""
+        User asked: {normalized_query}
+        Database facts: {db_answer or "N/A"}
+        Document context: {doc_context or "N/A"}
+        Web context: {web_context or "N/A"}
+        Task:
+        - Always give a human-like, professional, natural reply.
+        - If user asked about a specific field (like timeline, client name, leader, status), answer in 1–2 sentences only.
+        - For general queries, reply in short structured bullets.
+        - Never dump raw DB rows or raw doc chunks.
+        - Always keep response concise and clear.
+    "You are DebugMate, an intelligent assistant for We3Vision.\n"
+    "You maintain full conversation memory to provide context-aware, dependent replies.\n"
+    "Refer to past user messages before answering new ones.\n"
+    "Be concise, natural, and avoid repeating the same data unless relevant.\n"
+
+        """
+
+        messages = [
+            {"role": "system", "content": f"You are a helpful AI assistant for We3Vision. User: {user_name} ({user_email}), Role: {user_role}."},
+            *conv_hist,
+            {"role": "user", "content": synth_prompt}
+        ]
+
+        reply = call_openrouter(messages, temperature=0.5, max_tokens=2000)
+# -------------------- Save Chat & Memory --------------------
+        remember(user_email, user_input)
+        save_chat_message(user_email, "user", user_input)
+
+        # -------------------- Decide if table formatting is needed --------------------
+        if db_answer and isinstance(db_answer, list):
+            reply_text = format_table_response(db_answer)
+        else:
+            reply_text = reply  # LLM fallback
+
+        save_chat_message(user_email, "assistant", reply_text)
+
+
+        final_reply = format_response(user_input, fallback=reply_text)
+
+            # -------------------- ✅ Run Alignment System Only for Technical Queries --------------------
+        try:
+            project_data = supabase.table("projects").select("*").execute().data
+            if is_technical_prompt(user_input, project_data):
+                check = verify_response_final(user_input, final_reply, project_data, debug=False)
+      
+            #     if check.get("alignment_score") is not None:
+            #          final_reply += f"\n\n🔹 Accuracy: {check['alignment_score']} ({check['trust_level']})"
+            #     else:
+            #         print("ℹ️ Skipped accuracy display — no valid score.")
+            # else:
+            #     print("ℹ️ Skipped alignment — Non-technical/general query.")
+        except Exception as e:
+            print(f"⚠️ Alignment system failed: {e}")
+
+        # -------------------- Return Response --------------------
+        return jsonify({"reply": final_reply})
+    except Exception as e:
+        print("Chat error:", traceback.format_exc())
+        return jsonify({"reply": "⚠️ Error, please try again."})
+        
+# if __name__ == "_main_":
+#     import os
+#     port = int(os.environ.get("PORT", 8000))  # Render provides PORT env
+#     app.run(host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":  
+    if collection.count() == 0:
+        load_documents()
+    app.run(debug=True, port=8000) 
+    
+   
